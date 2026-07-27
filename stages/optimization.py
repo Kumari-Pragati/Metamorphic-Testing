@@ -24,80 +24,98 @@ METAMORPHIC RELATIONS FROM AGENT 3 (columns separated by ::):
 
 ---
 
-## OPTIMIZATION CRITERIA (apply all 6)
+## STANDING EXCEPTIONS (apply these BEFORE and ALONGSIDE the decision tree below —
+## they override whatever the tree would otherwise say, in every case)
 
-1. BEHAVIORAL IMPORTANCE
-   Core app behavior MRs must survive, but "survive" does NOT always mean the
-   decision "keep" — see Rule 2 below. MONOTONICITY, INVARIANCE, and
-   VALIDATION_CONSISTENCY relations must never be removed or downgraded to
-   "reduce_repetitions"/"partial_sampling"/"lower_priority", but the specific
-   decision value they get (keep vs. high_priority_keep) depends on Rule 2.
+- VALIDATION_CONSISTENCY MRs on DIFFERENT input fields (age, waist, height,
+  email, password, etc.) are NEVER redundant with each other, no matter how
+  many there are. Every one of them gets its own "high_priority_keep" — never
+  "reduce_repetitions", "partial_sampling", or "lower_priority", regardless
+  of how the decision tree below would otherwise classify a repeat.
+- MONOTONICITY and INPUT_TRANSFORMATION MRs on DIFFERENT measurable fields
+  (e.g. CycleLength vs. PeriodLength) are likewise NEVER redundant with each
+  other — each distinct field gets its own full decision from the tree below,
+  never automatically downgraded just because another MR shares the category.
+- If a category has only ONE MR total in the input, it can never be removed
+  or reduced to zero execution — it must land on "keep" or "high_priority_keep".
+- IMPORTANT DATA QUIRK: Agent 3 writes the SAME generic transformation text
+  ("Repeat the primary action a second time") for EVERY ROBUSTNESS MR,
+  regardless of which UI element it targets. The transformation column being
+  identical does NOT mean two ROBUSTNESS MRs are the same element — check
+  the follow_up_steps column instead, since that's the only place the actual
+  tapped element (icon/button name) appears. A DIFFERENT source_tc_id
+  almost always means a DIFFERENT element was tapped, even when the
+  transformation text matches exactly — treat these as Step 3
+  ("partial_sampling"), NOT Step 4 ("reduce_repetitions"), unless
+  follow_up_steps shows the identical element name.
 
-2. FAULT DETECTION POTENTIAL — USE "high_priority_keep" BY DEFAULT HERE
-   The following MR types are exactly the ones this project cares most about
-   catching regressions in, and should default to "high_priority_keep", NOT
-   "keep":
-   - Any VALIDATION_CONSISTENCY MR (invalid-to-valid or invalid-to-invalid
-     value changes) — these test real input validation bugs.
-   - Any INVARIANCE MR that is a unit conversion (e.g. CM|KG to IN|LB).
-   - Any MONOTONICITY MR testing a boundary transition (a value crossing
-     from a low to a clearly higher range).
-   Use plain "keep" for MRs that are important but do NOT match one of the
-   three cases above (e.g. tab-switch INVARIANCE, INPUT_TRANSFORMATION,
-   general ROBUSTNESS, INTERACTION_CONSISTENCY).
-
-3. REDUNDANCY / OVERLAP
-   ROBUSTNESS MRs: if multiple ROBUSTNESS MRs exist, keep the first one and
-   mark the REST as "partial_sampling" (not automatically "reduce_repetitions")
-   unless they are truly identical repeats of the exact same action on the
-   exact same element — reserve "reduce_repetitions" for that exact-duplicate
-   case, and use "partial_sampling" when the repeat targets a different
-   element (different icon, different button) but the same interaction
-   pattern, since it still has some residual, if reduced, value.
-   VALIDATION_CONSISTENCY MRs: each one tests a DIFFERENT input field (age,
-   waist, height are all separate fields). They are NEVER redundant with
-   each other — always keep all of them, per Rule 2 as "high_priority_keep".
-   Never mark VALIDATION_CONSISTENCY as lower_priority or reduce_repetitions
-   unless it is literally identical in both transformation AND field to
-   another MR in the same list.
-
-4. EXECUTION DIVERSITY
-   Keep at least one MR from each category that appears in the input. Do
-   partial sampling rather than full removal wherever a repeat isn't a true
-   exact duplicate — "partial_sampling" and "lower_priority" are there to be
-   used, not just "keep" and "reduce_repetitions". A screen with several
-   distinct-but-related MRs should show a MIX of decision values, not a
-   binary split.
-
-5. REPRESENTATIVE COVERAGE
-   Ensure at least one MR from EVERY category that appears in the input
-   survives. The FIRST MR of each category must always be "keep" or
-   "high_priority_keep" (per Rule 2's criteria) — never "reduce_repetitions"
-   or "partial_sampling". Only subsequent MRs of the same category on the
-   same element can be downgraded.
-
-6. EXECUTION COST
-   For MRs that are weak, marginal, or purely domain-dependent (not a true
-   duplicate, but also not fault-detection-critical) — use "lower_priority"
-   rather than defaulting to "keep". Do not treat "lower_priority" as a rare
-   exception; if an MR's value is genuinely marginal, say so with this label.
+These four exceptions apply to every MR before you walk the tree — check
+them FIRST for each MR. If none apply, THEN classify using the tree.
 
 ---
 
-## DECISION VALUES (use exactly these strings)
-- "keep"                → important, run every time
-- "high_priority_keep"  → critical, always run first
-- "lower_priority"      → domain-dependent or weak, run but deprioritize
-- "reduce_repetitions"  → overlaps another MR, reduce how often run
-- "partial_sampling"    → keep but only sample occasionally
+## DECISION TREE — walk through each MR and stop at the first step that
+## applies. Each step below IS its decision value; there is no separate
+## lookup required.
+
+STEP 1 — Is this MR one of the following fault-detection-critical types?
+   - VALIDATION_CONSISTENCY (any invalid-value change)
+   - INVARIANCE that is a unit conversion (e.g. CM|KG to IN|LB)
+   - MONOTONICITY testing a boundary transition (value crossing from low to
+     clearly higher)
+   → YES: decision = "high_priority_keep". These directly catch real
+     regressions and must always run first. STOP HERE.
+   → NO: continue to Step 2.
+
+STEP 2 — Is this the FIRST MR of its category on this screen (per the
+Standing Exceptions above where applicable), or an important MR that is
+not a repeat of anything else (e.g. the first ROBUSTNESS or
+INTERACTION_CONSISTENCY check on the screen, a tab-switch INVARIANCE,
+an INPUT_TRANSFORMATION not already covered by Step 1)?
+   → YES: decision = "keep". Important, run every time. STOP HERE.
+   → NO: continue to Step 3.
+
+STEP 3 — Compare this MR's follow_up_steps to the follow_up_steps of an
+already-classified MR of the same category. Do they target a DIFFERENT
+element (different icon, button, or tab name in follow_up_steps), even if
+the transformation column reads identically?
+   → YES: decision = "partial_sampling". Same pattern, different target —
+     retains some residual value, so sample it occasionally rather than
+     cutting it entirely. STOP HERE.
+   → NO: continue to Step 4.
+
+STEP 4 — Is this MR a TRUE exact duplicate — does follow_up_steps name the
+SAME element as an MR already classified as "keep" or "high_priority_keep"
+above (not just matching transformation text)?
+   → YES: decision = "reduce_repetitions". No new coverage value; run rarely
+     or never. STOP HERE.
+   → NO: continue to Step 5.
+
+STEP 5 — None of the above apply, but the MR still has some marginal,
+domain-dependent, or weak value (not a duplicate, not fault-critical, not
+clearly important).
+   → decision = "lower_priority". Use this whenever an MR genuinely fits
+     here — it is not a rare label reserved for edge cases.
+
+---
+
+## DECISION VALUES (exact strings — this is what Steps 1-5 above assign)
+- "high_priority_keep"  → Step 1: fault-detection-critical, always run first
+- "keep"                → Step 2: important, run every time
+- "partial_sampling"    → Step 3: same pattern/different element, sample occasionally
+- "reduce_repetitions"  → Step 4: true exact duplicate, run rarely/never
+- "lower_priority"      → Step 5: weak/marginal/domain-dependent, deprioritize
 
 ---
 
 ## RULES
 - Do NOT aggressively delete MRs — prefer downgrading to removing.
 - Every mr_id from input must appear in output with a decision.
-- Reason must be a short, specific sentence (not generic).
-- If only 1 MR exists for a category, never remove it entirely.
+- Reason must be a short, specific sentence naming which step/exception applied
+  (not generic).
+- A screen with several distinct-but-related MRs should show a MIX of
+  decision values across Steps 1-5 — do not collapse everything into just
+  "keep" and "reduce_repetitions".
 
 ---
 
@@ -147,12 +165,23 @@ DECISION_ORDER = {
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _mr_data_to_csv_string(mr_data: dict) -> str:
-    """Convert Agent 3 MR dict to a compact CSV string for the prompt."""
-    lines = ["mr_id :: source_tc_id :: mr_category :: transformation :: expected_relation :: confidence"]
+    """
+    Convert Agent 3 MR dict to a compact CSV string for the prompt. Includes
+    follow_up_steps because Agent 3 uses one generic transformation string
+    for every ROBUSTNESS repeat ("Repeat the primary action a second time")
+    regardless of which UI element it targets — without follow_up_steps,
+    Agent 4 has no way to tell "tap the LinkedIn icon twice" apart from
+    "tap the Facebook icon twice", since both look identical in every other
+    column. follow_up_steps is the only field that actually names the element.
+    """
+    lines = ["mr_id :: source_tc_id :: mr_category :: transformation :: follow_up_steps :: expected_relation :: confidence"]
     for mr in mr_data.get("metamorphic_relations", []):
+        steps = mr.get("follow_up_steps", [])
+        steps_str = " | ".join(steps) if isinstance(steps, list) else str(steps)
         lines.append(
             f"{mr.get('mr_id','')} :: {mr.get('source_tc_id','')} :: "
             f"{mr.get('mr_category','')} :: {mr.get('transformation','')} :: "
+            f"{steps_str} :: "
             f"{mr.get('expected_relation','')} :: {mr.get('confidence','')}"
         )
     return "\n".join(lines)
@@ -227,7 +256,7 @@ def optimize_metamorphic_relations(mr_data: dict, model, tokenizer) -> dict:
         text,
         return_tensors="pt",
         truncation=True,
-        max_length=4096,
+        max_length=6144,
     ).to("cuda")
 
     print(f"   🔄 Optimizing metamorphic relations (Agent 4)...")
@@ -276,6 +305,7 @@ def optimize_metamorphic_relations(mr_data: dict, model, tokenizer) -> dict:
 
         optimized = _sort_by_decision(optimized)
         optimized = _enforce_coverage_rules(optimized, mr_data)
+        optimized = _upgrade_fault_critical_keeps(optimized)
 
         result["optimized_relations"] = optimized
         result["screen_id"] = screen_id
@@ -311,6 +341,28 @@ def _is_fault_detection_critical(mr: dict) -> bool:
         return True  # boundary-transition value increases, per Rule 2
 
     return False
+
+
+def _upgrade_fault_critical_keeps(optimized: list) -> list:
+    """
+    Safety net for a gap _enforce_coverage_rules doesn't cover: that function
+    only upgrades a decision when RESCUING an MR the LLM demoted to
+    reduce_repetitions/partial_sampling/lower_priority. If the LLM's own
+    first-pass choice was already "keep" for a fault-detection-critical MR
+    (VALIDATION_CONSISTENCY, unit-conversion INVARIANCE, MONOTONICITY),
+    nothing previously corrected that "keep" up to "high_priority_keep" —
+    it was never treated as needing rescue since "keep" isn't a demoted
+    state. This pass catches exactly that case.
+    """
+    for opt in optimized:
+        if opt.get("decision") == "keep" and _is_fault_detection_critical(opt):
+            opt["decision"] = "high_priority_keep"
+            opt["reason"] = (
+                f"Upgraded from 'keep': {opt.get('mr_category','')} is "
+                f"fault-detection-critical per Rule 2 and must be "
+                f"'high_priority_keep', not plain 'keep'"
+            )
+    return optimized
 
 
 def _enforce_coverage_rules(optimized: list, mr_data: dict) -> list:
