@@ -24,6 +24,54 @@ METAMORPHIC RELATIONS FROM AGENT 3 (columns separated by ::):
 
 ---
 
+## CORE PRINCIPLE — "Computable Ground Truth" (read this before Step 1)
+
+Not all MR categories carry the same evidentiary weight when they fail, and the
+decision tree below is built around ONE governing distinction:
+
+  - A CORRECTNESS-VERIFYING MR has a deterministic, computable expected value
+    that the follow-up output must match exactly (e.g. "ratio must increase",
+    "converted value must equal 2.54x the original", "still-invalid input must
+    still be rejected"). A failure here is an unambiguous logic/computation bug.
+
+  - A BEHAVIOR-STABILITY MR has no computable expected value to check against —
+    it only verifies that behavior remains "stable" or "does not break" under a
+    small perturbation (e.g. "app should not crash on a repeated tap", "tapping
+    icons in reverse order should not corrupt state", "switching tabs and back
+    should not lose content"). A failure here signals instability, but there is
+    no numeric ground truth being verified.
+
+Only CORRECTNESS-VERIFYING MRs are eligible for "high_priority_keep". This means:
+  - VALIDATION_CONSISTENCY   → always correctness-verifying (invalid input must
+    deterministically stay invalid) → eligible.
+  - MONOTONICITY             → always correctness-verifying (a computed value
+    must move in the expected direction) → eligible.
+  - INVARIANCE               → ELIGIBLE ONLY when the transformation preserves a
+    quantifiable, numeric value (unit/currency/measurement conversion, e.g.
+    cm→inch, kg→lb, USD→EUR). NOT eligible when the "invariant" being checked is
+    UI state persistence across navigation (e.g. switching tabs/screens and
+    back) — that is a behavior-stability check, not a computed-value check,
+    even though it shares the INVARIANCE category label.
+  - INTERACTION_CONSISTENCY  → NOT eligible. Per its own definition ("similar UI
+    interactions should preserve STABLE behavior"), this is a behavior-stability
+    check (does end-state stay equivalent regardless of tap order), not a
+    computed-value check. It still matters — the first instance per screen is
+    "keep" (Step 2) — but it cannot be high_priority_keep.
+  - ROBUSTNESS               → NOT eligible. Binary crash/no-crash check, no
+    computed expected value.
+  - INPUT_TRANSFORMATION     → NOT eligible on its own. It generates a follow-up
+    test through a controlled input change but does not itself assert a
+    checkable relation; the relation it feeds (typically MONOTONICITY) is what
+    gets evaluated for fault-detection criticality.
+
+When you assign "high_priority_keep", your "reason" field MUST name which of the
+three eligible cases applies (invalid-input consistency / monotonic computation /
+numeric-value-preserving conversion). If an MR does not fit one of those three
+cases, it CANNOT be "high_priority_keep" — even if it feels important — it should
+be "keep" instead (Step 2).
+
+---
+
 ## STANDING EXCEPTIONS (apply these BEFORE and ALONGSIDE the decision tree below —
 ## they override whatever the tree would otherwise say, in every case)
 
@@ -37,7 +85,10 @@ METAMORPHIC RELATIONS FROM AGENT 3 (columns separated by ::):
   other — each distinct field gets its own full decision from the tree below,
   never automatically downgraded just because another MR shares the category.
 - If a category has only ONE MR total in the input, it can never be removed
-  or reduced to zero execution — it must land on "keep" or "high_priority_keep".
+  or reduced to zero execution — it must land on "keep" or "high_priority_keep"
+  (per the Computable Ground Truth principle above — never assign
+  "high_priority_keep" here unless the lone MR is itself one of the three
+  eligible cases).
 - IMPORTANT DATA QUIRK: Agent 3 writes the SAME generic transformation text
   ("Repeat the primary action a second time") for EVERY ROBUSTNESS MR,
   regardless of which UI element it targets. The transformation column being
@@ -58,13 +109,13 @@ them FIRST for each MR. If none apply, THEN classify using the tree.
 ## applies. Each step below IS its decision value; there is no separate
 ## lookup required.
 
-STEP 1 — Is this MR one of the following fault-detection-critical types?
-   - VALIDATION_CONSISTENCY (any invalid-value change)
-   - INVARIANCE that is a unit conversion (e.g. CM|KG to IN|LB)
-   - MONOTONICITY testing a boundary transition (value crossing from low to
-     clearly higher)
+STEP 1 — Does this MR fit ONE of the three eligible cases defined in the
+Computable Ground Truth principle above (VALIDATION_CONSISTENCY; MONOTONICITY;
+or INVARIANCE that preserves a numeric/quantifiable value, e.g. a unit
+conversion — NOT a tab/screen-switch invariance)?
    → YES: decision = "high_priority_keep". These directly catch real
-     regressions and must always run first. STOP HERE.
+     regressions and must always run first. Name the specific eligible case
+     in your reason. STOP HERE.
    → NO: continue to Step 2.
 
 STEP 2 — Is this the FIRST MR of its category on this screen (per the
@@ -91,20 +142,27 @@ above (not just matching transformation text)?
      or never. STOP HERE.
    → NO: continue to Step 5.
 
-STEP 5 — None of the above apply, but the MR still has some marginal,
-domain-dependent, or weak value (not a duplicate, not fault-critical, not
-clearly important).
+STEP 5 — None of Steps 1-4 apply. This step is reserved SPECIFICALLY for
+MRs whose underlying premise is speculative or domain-dependent — i.e. Agent 3
+itself would reasonably mark this MR as lower-confidence (the expected
+relation depends on assumptions about app behavior that are not verifiable
+from the source test case alone). Do NOT use this step for "same pattern,
+different element" — that is Step 3's job, not Step 5's. Only use Step 5 when
+the MR's expected relation itself is uncertain, not when its execution
+frequency should simply be lower.
    → decision = "lower_priority". Use this whenever an MR genuinely fits
-     here — it is not a rare label reserved for edge cases.
+     this specific description — it is not a rare label reserved for edge
+     cases, but it is also not a catch-all for "not important."
 
 ---
 
 ## DECISION VALUES (exact strings — this is what Steps 1-5 above assign)
-- "high_priority_keep"  → Step 1: fault-detection-critical, always run first
+- "high_priority_keep"  → Step 1: fits one of the three computable-ground-truth
+  eligible cases; fault-detection-critical; always run first
 - "keep"                → Step 2: important, run every time
 - "partial_sampling"    → Step 3: same pattern/different element, sample occasionally
 - "reduce_repetitions"  → Step 4: true exact duplicate, run rarely/never
-- "lower_priority"      → Step 5: weak/marginal/domain-dependent, deprioritize
+- "lower_priority"      → Step 5: expected relation itself is speculative/domain-dependent
 
 ---
 
@@ -112,10 +170,16 @@ clearly important).
 - Do NOT aggressively delete MRs — prefer downgrading to removing.
 - Every mr_id from input must appear in output with a decision.
 - Reason must be a short, specific sentence naming which step/exception applied
-  (not generic).
+  (not generic). For "high_priority_keep", name the specific eligible case
+  (invalid-input consistency / monotonic computation / numeric-value-preserving
+  conversion) per the Computable Ground Truth principle.
 - A screen with several distinct-but-related MRs should show a MIX of
   decision values across Steps 1-5 — do not collapse everything into just
   "keep" and "reduce_repetitions".
+- Never assign "high_priority_keep" to ROBUSTNESS, INTERACTION_CONSISTENCY,
+  INPUT_TRANSFORMATION, or tab/screen-switch INVARIANCE. These categories are
+  behavior-stability checks, not computed-value checks, and are structurally
+  capped at "keep" even in their most important instance.
 
 ---
 
@@ -161,6 +225,50 @@ DECISION_ORDER = {
     "lower_priority":      5,
 }
 
+# Categories eligible for "high_priority_keep" under the Computable Ground
+# Truth principle. INVARIANCE is included here but is further gated inside
+# _is_fault_detection_critical() to only its numeric/quantity-preserving
+# subset (unit conversion etc.), NOT tab/screen-switch invariance.
+FAULT_CRITICAL_ELIGIBLE_CATEGORIES = {
+    "VALIDATION_CONSISTENCY",
+    "MONOTONICITY",
+    "INVARIANCE",
+}
+
+# Keyword set used to detect numeric/quantity-preserving INVARIANCE
+# (unit, currency, or measurement conversion) as opposed to UI-state
+# persistence invariance (tab/screen switches). This is a heuristic, not a
+# semantic parse — documented explicitly here (rather than left as an
+# unexplained regex) because it is the operational definition used in the
+# paper's methods section for "numeric-value-preserving invariance".
+_QUANTITY_CONVERSION_KEYWORDS = (
+    "unit", "|", "cm", "inch", "in ", "kg", "lb", "mile", "km",
+    "usd", "eur", "gbp", "currency", "celsius", "fahrenheit",
+    "convert", "conversion",
+)
+
+# Word-boundary regex version of the keyword set above. Plain substring
+# matching (kw in transformation) let bare words like "in" match INSIDE
+# other words with no boundary — e.g. "Switch away from 'Spin to Win' and
+# back" contains "in " twice (inside "Spin" and "Win") and was incorrectly
+# promoted to high_priority_keep as if it were a unit conversion. This
+# pattern requires the keyword to appear as its own word.
+_QUANTITY_CONVERSION_PATTERN = re.compile(
+    r"\b(unit|cm|inch|in|kg|lb|mile|km|usd|eur|gbp|currency|"
+    r"celsius|fahrenheit|convert|conversion)\b",
+    re.IGNORECASE,
+)
+
+# Signals that a transformation string follows Agent 3's known ROBUSTNESS
+# boilerplate pattern ("Repeat the primary action a second time"), used as
+# a defensive check against Agent 3 mislabeling MRs into the wrong
+# mr_category (e.g. tagging a robustness repeat as INVARIANCE), which would
+# otherwise let that MR wrongly claim a coverage "survivor" slot for a
+# category it doesn't actually belong to.
+_ROBUSTNESS_PATTERN_HINTS = re.compile(
+    r"\b(repeat|repeated|again|second time|retry)\b", re.IGNORECASE
+)
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -204,6 +312,32 @@ def _safe_join(val):
         str(v) if not isinstance(v, dict) else json.dumps(v)
         for v in val
     )
+
+
+def _category_label_is_trustworthy(opt: dict) -> bool:
+    """
+    Defensive check against Agent 3 mislabeling. Observed in production data:
+    Agent 3 sometimes tags a ROBUSTNESS-pattern MR (transformation =
+    "Repeat the primary action a second time") with mr_category="INVARIANCE".
+    Because the coverage rule below trusts mr_category to find "one survivor
+    per (category, source_tc_id)", a mislabeled entry can wrongly claim the
+    INVARIANCE survivor slot for that source_tc_id — then the REAL invariance
+    MR on the same source_tc_id gets incorrectly flagged as a duplicate and
+    demoted to reduce_repetitions, even though it's a completely different,
+    legitimate check.
+
+    Returns False when the transformation text looks like the ROBUSTNESS
+    boilerplate pattern but the category claims to be something else
+    (currently checked for INVARIANCE, the case seen in practice). An MR
+    that fails this check is not allowed to occupy a coverage-slot as its
+    labeled category in _enforce_coverage_rules.
+    """
+    cat = opt.get("mr_category", "")
+    transformation = opt.get("transformation", "") or ""
+    looks_robustness = bool(_ROBUSTNESS_PATTERN_HINTS.search(transformation))
+    if cat == "INVARIANCE" and looks_robustness:
+        return False
+    return True
 
 
 def _sort_by_decision(optimized: list) -> list:
@@ -306,6 +440,7 @@ def optimize_metamorphic_relations(mr_data: dict, model, tokenizer) -> dict:
         optimized = _sort_by_decision(optimized)
         optimized = _enforce_coverage_rules(optimized, mr_data)
         optimized = _upgrade_fault_critical_keeps(optimized)
+        optimized = _demote_ineligible_high_priority_keeps(optimized)
 
         result["optimized_relations"] = optimized
         result["screen_id"] = screen_id
@@ -320,25 +455,55 @@ def optimize_metamorphic_relations(mr_data: dict, model, tokenizer) -> dict:
         return _fallback_keep_all(mr_data)
 
 
+def _is_quantity_preserving_invariance(mr: dict) -> bool:
+    """
+    True only for INVARIANCE MRs that preserve a quantifiable/numeric value
+    (unit, currency, or measurement conversion) rather than checking UI-state
+    persistence (tab/screen-switch invariance). This is the operational
+    definition of "numeric-value-preserving invariance" referenced in the
+    Computable Ground Truth principle in OPTIMIZATION_PROMPT_TEMPLATE — kept
+    as a single documented keyword list (rather than an ad hoc inline check)
+    so the paper's methods section and the code stay in sync.
+
+    This is a heuristic over the transformation text, not a semantic parse,
+    and is intentionally conservative: false negatives (missing a real
+    conversion MR) fail safe into "keep" rather than "high_priority_keep",
+    which matches the "prefer downgrading to removing" rule.
+    """
+    if mr.get("mr_category", "") != "INVARIANCE":
+        return False
+    transformation = mr.get("transformation", "") or ""
+    return bool(_QUANTITY_CONVERSION_PATTERN.search(transformation)) or "|" in transformation
+
 
 def _is_fault_detection_critical(mr: dict) -> bool:
     """
-    True if this MR matches Rule 2's fault-detection-critical criteria
-    (boundary transitions, invalid-to-valid changes, unit conversion) and
-    therefore deserves 'high_priority_keep' rather than plain 'keep' when
-    the coverage rule forces it to survive.
+    True if this MR fits one of the three Computable Ground Truth eligible
+    cases defined in OPTIMIZATION_PROMPT_TEMPLATE, and therefore deserves
+    'high_priority_keep' rather than plain 'keep':
+      1. VALIDATION_CONSISTENCY — invalid-to-invalid input consistency.
+      2. MONOTONICITY — a computed value must move in the expected direction.
+      3. INVARIANCE, but ONLY the numeric/quantity-preserving subset (see
+         _is_quantity_preserving_invariance) — NOT tab/screen-switch
+         invariance, which is a behavior-stability check, not a
+         computed-value check.
+
+    All other categories (ROBUSTNESS, INTERACTION_CONSISTENCY,
+    INPUT_TRANSFORMATION) are behavior-stability or test-generation
+    mechanisms without a computable expected value, and are therefore
+    structurally capped at "keep" — see _demote_ineligible_high_priority_keeps
+    for the enforcement side of this rule.
     """
     category = mr.get("mr_category", "")
-    transformation = mr.get("transformation", "").lower()
 
     if category == "VALIDATION_CONSISTENCY":
-        return True  # invalid-value changes are exactly Rule 2's "invalid-to-valid" case
-
-    if category == "INVARIANCE" and ("unit" in transformation or "|" in transformation):
-        return True  # unit-toggle invariance (CM|KG etc.), not tab-switch invariance
+        return True
 
     if category == "MONOTONICITY":
-        return True  # boundary-transition value increases, per Rule 2
+        return True
+
+    if category == "INVARIANCE":
+        return _is_quantity_preserving_invariance(mr)
 
     return False
 
@@ -349,19 +514,56 @@ def _upgrade_fault_critical_keeps(optimized: list) -> list:
     only upgrades a decision when RESCUING an MR the LLM demoted to
     reduce_repetitions/partial_sampling/lower_priority. If the LLM's own
     first-pass choice was already "keep" for a fault-detection-critical MR
-    (VALIDATION_CONSISTENCY, unit-conversion INVARIANCE, MONOTONICITY),
-    nothing previously corrected that "keep" up to "high_priority_keep" —
-    it was never treated as needing rescue since "keep" isn't a demoted
-    state. This pass catches exactly that case.
+    (VALIDATION_CONSISTENCY, numeric-value-preserving INVARIANCE,
+    MONOTONICITY), nothing previously corrected that "keep" up to
+    "high_priority_keep" — it was never treated as needing rescue since
+    "keep" isn't a demoted state. This pass catches exactly that case.
     """
     for opt in optimized:
         if opt.get("decision") == "keep" and _is_fault_detection_critical(opt):
             opt["decision"] = "high_priority_keep"
             opt["reason"] = (
                 f"Upgraded from 'keep': {opt.get('mr_category','')} is "
-                f"fault-detection-critical per Rule 2 and must be "
-                f"'high_priority_keep', not plain 'keep'"
+                f"fault-detection-critical per the Computable Ground Truth "
+                f"principle and must be 'high_priority_keep', not plain 'keep'"
             )
+    return optimized
+
+
+def _demote_ineligible_high_priority_keeps(optimized: list) -> list:
+    """
+    Hard invariant enforcement: NO MR outside FAULT_CRITICAL_ELIGIBLE_CATEGORIES
+    (and, for INVARIANCE, outside its numeric-value-preserving subset) may end
+    up as "high_priority_keep" in the final output, regardless of what the LLM
+    emitted directly or what any upstream rule assigned.
+
+    This closes a real gap observed empirically: categories such as
+    INPUT_TRANSFORMATION (which has no eligibility path in
+    _is_fault_detection_critical) were still appearing as "high_priority_keep"
+    in production output, meaning the LLM's raw output was reaching the final
+    CSV uncapped in at least some cases. Rather than rely solely on the LLM
+    following the prompt's rules, this function makes the "only three eligible
+    cases" rule a deterministic, code-enforced invariant — required for the
+    paper's methods section to accurately describe Agent 4 as a hybrid
+    LLM + rule-based system rather than a pure LLM classifier.
+
+    Any MR downgraded here becomes "keep" (never lower) — consistent with the
+    "prefer downgrading to removing" rule and with the fact that the MR was
+    still judged important enough to survive by whatever upstream logic put
+    it here in the first place.
+    """
+    for opt in optimized:
+        if opt.get("decision") != "high_priority_keep":
+            continue
+        if _is_fault_detection_critical(opt):
+            continue
+        opt["decision"] = "keep"
+        opt["reason"] = (
+            f"Fallback mapping — '{opt.get('mr_category','')}' is not one of "
+            f"the three Computable Ground Truth eligible categories "
+            f"(VALIDATION_CONSISTENCY, MONOTONICITY, numeric-value-preserving "
+            f"INVARIANCE); decision clamped from 'high_priority_keep' to 'keep'"
+        )
     return optimized
 
 
@@ -384,13 +586,17 @@ def _enforce_coverage_rules(optimized: list, mr_data: dict) -> list:
        repetitions"), the reason is fully replaced rather than appended to.
 
     4. When this function is FORCED to make an MR survive (it wasn't already
-       keep/high_priority_keep), it checks whether that MR meets Rule 2's
-       fault-detection-critical criteria (via _is_fault_detection_critical) and
-       assigns "high_priority_keep" instead of a flat "keep" when it does. This
-       fixes a bug where the coverage rule always defaulted to "keep" even for
-       MRs the prompt itself says should be "high_priority_keep" — causing
+       keep/high_priority_keep), it checks whether that MR meets the Computable
+       Ground Truth criteria (via _is_fault_detection_critical) and assigns
+       "high_priority_keep" instead of a flat "keep" when it does. This fixes a
+       bug where the coverage rule always defaulted to "keep" even for MRs the
+       prompt itself says should be "high_priority_keep" — causing
        high_priority_keep to almost never appear in real output regardless of
-       how many boundary/invalid-value/unit-conversion MRs were present.
+       how many boundary/invalid-value/unit-conversion MRs were present. Note
+       that the eligibility check itself now excludes tab-switch INVARIANCE and
+       INTERACTION_CONSISTENCY (see _is_fault_detection_critical), so this will
+       correctly assign "keep" — not "high_priority_keep" — when forcing survival
+       of those categories.
     """
     mr_lookup = {mr.get("mr_id", ""): mr for mr in mr_data.get("metamorphic_relations", [])}
 
@@ -458,6 +664,25 @@ def _enforce_coverage_rules(optimized: list, mr_data: dict) -> list:
     for opt in optimized:
         cat = opt.get("mr_category", "")
         if cat not in NEVER_REDUNDANT_CATEGORIES:
+            continue
+
+        # Mislabeling guard: if this MR's transformation text looks like
+        # Agent 3's ROBUSTNESS boilerplate but it's tagged with a
+        # NEVER_REDUNDANT category (e.g. INVARIANCE), don't let it occupy
+        # or consume that category's survivor slot for this source_tc_id.
+        # It's forced to a safe "keep" on its own, separately, so the real
+        # MR of that category on the same source_tc_id isn't wrongly
+        # flagged as a duplicate.
+        if not _category_label_is_trustworthy(opt):
+            decision = opt.get("decision", "")
+            if decision not in ("keep", "high_priority_keep"):
+                opt["decision"] = "keep"
+            opt["reason"] = (
+                f"Mislabel guard: transformation text matches the ROBUSTNESS "
+                f"boilerplate pattern despite being tagged '{cat}' — kept "
+                f"independently without occupying the {cat} coverage slot "
+                f"for this source test case, pending an Agent 3 relabel"
+            )
             continue
 
         key = (cat, opt.get("source_tc_id", ""))

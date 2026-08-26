@@ -1,16 +1,21 @@
 # main.py
 #
-# Single-run pipeline — runs the full 5-agent pipeline ONCE using Qwen
-# (Qwen2-VL-7B-Instruct + Qwen2.5-7B-Instruct) across every image in
-# images/, with per-agent emissions logged to outputs/emissions_log.csv.
+# Runs the full 5-agent pipeline using Qwen across images in images/.
+# Supports batching and resume: run this script multiple times with
+# --batch-size to process the dataset in chunks across separate sessions.
+# Already-completed screens are automatically skipped on the next run.
 #
-# For the full multi-model, multi-run benchmark (Qwen vs Phi vs InternVL vs
-# InternLM, 5 runs each, per-model emissions logs), use
-# benchmark_pipeline.py --model <name> instead — see README.md.
+# Usage:
+#   python main.py --batch-size 200        (process next 200 unprocessed images)
+#   python main.py                          (process ALL remaining unprocessed images)
+#   python main.py --fresh                  (wipe all outputs/checkpoint, start over)
+#   python main.py --fresh --batch-size 200 (start over, process first 200)
 
+import argparse
 import os
 import csv
 import time
+import shutil
 import traceback
 from codecarbon import EmissionsTracker
 from stages.ui_analysis        import load_model, analyze_ui, save_ui_data
@@ -34,6 +39,25 @@ from stages.optimization_reduction import (
 
 IMAGES_DIR = "images/"
 TOPICS_CSV = "design_topics.csv"
+CHECKPOINT_FILE = "outputs/completed_screens.txt"
+
+# ─── CLI args ─────────────────────────────────────────────────────────────────
+
+parser = argparse.ArgumentParser(description="Run the 5-agent pipeline, optionally in batches with resume.")
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=None,
+    help="Number of NEW (not-yet-completed) images to process this run. "
+         "Omit to process all remaining images.",
+)
+parser.add_argument(
+    "--fresh",
+    action="store_true",
+    help="Wipe the checkpoint and all output CSVs/emissions log before starting, "
+         "as if running for the first time.",
+)
+args = parser.parse_args()
 
 # ─── Emissions log columns ────────────────────────────────────────────────────
 EMISSIONS_LOG = "outputs/emissions_log.csv"
@@ -45,12 +69,22 @@ EMISSIONS_COLUMNS = [
     "region", "country_name", "country_iso_code",
 ]
 
+MASTER_FILES = [
+    "outputs/testcases_master.csv",
+    "outputs/metamorphic_relations_master.csv",
+    "outputs/optimized_relations_master.csv",
+    "outputs/reduced_suite_master.csv",
+    "outputs/energy_savings_summary.csv",
+]
+
+
 def _init_emissions_log():
     os.makedirs("outputs", exist_ok=True)
     if os.path.exists(EMISSIONS_LOG):
         os.remove(EMISSIONS_LOG)
     with open(EMISSIONS_LOG, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=EMISSIONS_COLUMNS).writeheader()
+
 
 def _log_emissions(screen_id: str, agent: str, tracker: EmissionsTracker, duration_s: float):
     emissions_kg = tracker.stop()
@@ -82,6 +116,40 @@ def _log_emissions(screen_id: str, agent: str, tracker: EmissionsTracker, durati
           f"GPU: {round(data.gpu_power, 2) if data else 0.0}W | "
           f"region: {data.region if data else 'unknown'}")
 
+
+def _load_checkpoint() -> set:
+    if not os.path.exists(CHECKPOINT_FILE):
+        return set()
+    with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f if line.strip())
+
+
+def _mark_completed(screen_id: str):
+    os.makedirs("outputs", exist_ok=True)
+    with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
+        f.write(screen_id + "\n")
+
+
+# ─── Fresh start: wipe everything ─────────────────────────────────────────────
+
+if args.fresh:
+    if os.path.exists("outputs"):
+        shutil.rmtree("outputs")
+        print("🗑️  --fresh: cleared outputs/ entirely")
+    os.makedirs("outputs", exist_ok=True)
+
+completed_screens = _load_checkpoint()
+is_first_run = not os.path.exists(EMISSIONS_LOG)
+
+if is_first_run:
+    for master_path in MASTER_FILES:
+        if os.path.exists(master_path):
+            os.remove(master_path)
+    _init_emissions_log()
+    print("🌱 Emissions log initialized (first run)")
+else:
+    print(f"🌱 Resuming — {len(completed_screens)} screens already completed, appending to existing logs")
+
 # ─── Load topic mapping ───────────────────────────────────────────────────────
 id_to_topic = {}
 if os.path.exists(TOPICS_CSV):
@@ -95,22 +163,6 @@ if os.path.exists(TOPICS_CSV):
 else:
     print(f"⚠️  {TOPICS_CSV} not found — topics will be 'unknown'")
 
-# ─── Clear master CSVs and init emissions log ─────────────────────────────────
-master_files = [
-    "outputs/testcases_master.csv",
-    "outputs/metamorphic_relations_master.csv",
-    "outputs/optimized_relations_master.csv",
-    "outputs/reduced_suite_master.csv",
-    "outputs/energy_savings_summary.csv",
-]
-for master_path in master_files:
-    if os.path.exists(master_path):
-        os.remove(master_path)
-        print(f"🗑️  Cleared {master_path} — rebuilding fresh")
-
-_init_emissions_log()
-print("🌱 Emissions log initialized")
-
 # ─── Load vision model once (Agent 1) — NOT tracked, this is setup cost ──────
 print("\nLoading vision model (Agent 1)...")
 vision_model, processor = load_model()
@@ -119,19 +171,38 @@ vision_model, processor = load_model()
 print("\nLoading text model (Agents 2 / 3 / 4 / 5)...")
 text_model, text_tokenizer = load_text_model()
 
-# ─── Process every image ─────────────────────────────────────────────────────
-image_files = sorted([
+# ─── Determine which images still need processing ────────────────────────────
+all_image_files = sorted([
     f for f in os.listdir(IMAGES_DIR)
     if f.endswith((".png", ".jpg", ".jpeg"))
 ])
-print(f"\n📁 Found {len(image_files)} images to process")
 
-for image_file in image_files:
+remaining = [
+    f for f in all_image_files
+    if os.path.splitext(f)[0] not in completed_screens
+]
+
+print(f"\n📁 {len(all_image_files)} total images | {len(completed_screens)} already done | {len(remaining)} remaining")
+
+if args.batch_size is not None:
+    image_files = remaining[:args.batch_size]
+    print(f"📦 Batch mode: processing {len(image_files)} of {len(remaining)} remaining images this run")
+else:
+    image_files = remaining
+    print(f"📦 Processing all {len(image_files)} remaining images this run")
+
+if not image_files:
+    print("\n✅ Nothing left to process — all images already completed.")
+    raise SystemExit(0)
+
+# ─── Process images ────────────────────────────────────────────────────────────
+
+for idx, image_file in enumerate(image_files, start=1):
     full_path = os.path.join(IMAGES_DIR, image_file)
     screen_id = os.path.splitext(image_file)[0]
     topic     = id_to_topic.get(screen_id, "unknown")
 
-    print(f"\n── Agent 1-5 Pipeline: {image_file} (topic: {topic}) ──")
+    print(f"\n── [{idx}/{len(image_files)}] {image_file} (topic: {topic}) ──")
 
     try:
         # ── Agent 1 — Perception ──────────────────────────────────────────
@@ -215,12 +286,19 @@ for image_file in image_files:
         append_reduced_to_master(reduced_data)
         append_savings_summary(reduced_data)
 
-        print(f"✅ Pipeline complete for {screen_id}")
+        # ── Mark this screen done — only after ALL agents succeeded ────────
+        _mark_completed(screen_id)
+        print(f"✅ Pipeline complete for {screen_id} ({idx}/{len(image_files)} this run)")
 
     except Exception as e:
         traceback.print_exc()
-        print(f"❌ Failed on {image_file}: {e}")
+        print(f"❌ Failed on {image_file}: {e} — NOT marked complete, will retry next run")
         continue
 
-print("\n✅ All agents finished")
+remaining_after = len(remaining) - len(image_files)
+print(f"\n✅ Batch finished — {len(image_files)} images processed this run")
+if remaining_after > 0:
+    print(f"📦 {remaining_after} images still remaining — run again with the same command to continue")
+else:
+    print("🎉 All images in the dataset have now been processed")
 print(f"🌱 Emissions log saved → {EMISSIONS_LOG}")
