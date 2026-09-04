@@ -57,6 +57,16 @@ parser.add_argument(
     help="Wipe the checkpoint and all output CSVs/emissions log before starting, "
          "as if running for the first time.",
 )
+parser.add_argument(
+    "--batch-id",
+    type=int,
+    default=None,
+    help="If provided, this run's results are ALSO written to "
+         "outputs/batches/batch_<id>/ (per-batch CSVs + a batch_summary.csv), "
+         "in addition to appending to the combined master files in outputs/. "
+         "Each batch-id is expected to be used exactly once — its files are "
+         "freshly created (not appended) at the start of the run.",
+)
 args = parser.parse_args()
 
 # ─── Emissions log columns ────────────────────────────────────────────────────
@@ -77,6 +87,41 @@ MASTER_FILES = [
     "outputs/energy_savings_summary.csv",
 ]
 
+# ─── Per-batch output setup (only active when --batch-id is passed) ──────────
+BATCH_ID  = args.batch_id
+BATCH_DIR = f"outputs/batches/batch_{BATCH_ID:03d}" if BATCH_ID is not None else None
+
+if BATCH_DIR:
+    os.makedirs(BATCH_DIR, exist_ok=True)
+
+    BATCH_EMISSIONS_LOG = f"{BATCH_DIR}/emissions_log.csv"
+    BATCH_SCREENS_FILE  = f"{BATCH_DIR}/screens.txt"
+    BATCH_SUMMARY_FILE  = f"{BATCH_DIR}/batch_summary.csv"
+    BATCH_MASTER_PATHS = {
+        "testcases": f"{BATCH_DIR}/testcases_master.csv",
+        "mrs":       f"{BATCH_DIR}/metamorphic_relations_master.csv",
+        "optimized": f"{BATCH_DIR}/optimized_relations_master.csv",
+        "reduced":   f"{BATCH_DIR}/reduced_suite_master.csv",
+        "savings":   f"{BATCH_DIR}/energy_savings_summary.csv",
+    }
+
+    # A batch-id is expected to be used exactly once — start its files fresh
+    # each run rather than appending, so a re-run with the same id can't
+    # silently mix two different batches' data together.
+    for _p in [BATCH_EMISSIONS_LOG, BATCH_SCREENS_FILE, BATCH_SUMMARY_FILE, *BATCH_MASTER_PATHS.values()]:
+        if os.path.exists(_p):
+            os.remove(_p)
+
+    with open(BATCH_EMISSIONS_LOG, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=EMISSIONS_COLUMNS).writeheader()
+
+    _batch_started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+else:
+    BATCH_EMISSIONS_LOG = None
+    BATCH_SCREENS_FILE  = None
+    BATCH_SUMMARY_FILE  = None
+    BATCH_MASTER_PATHS  = {}
+
 
 def _init_emissions_log():
     os.makedirs("outputs", exist_ok=True)
@@ -92,29 +137,69 @@ def _log_emissions(screen_id: str, agent: str, tracker: EmissionsTracker, durati
 
     energy_kwh = data.energy_consumed if data else 0.0
 
+    row = {
+        "screen_id":              screen_id,
+        "agent":                  agent,
+        "energy_kwh":             round(energy_kwh, 6),
+        "emissions_kg_co2":       round(emissions_kg or 0.0, 8),
+        "total_emissions_kg_co2": round(emissions_kg or 0.0, 8),
+        "duration_seconds":       round(duration_s, 2),
+        "ram_power_w":            round(data.ram_power, 4)        if data else 0.0,
+        "cpu_power_w":            round(data.cpu_power, 4)        if data else 0.0,
+        "gpu_power_w":            round(data.gpu_power, 4)        if data else 0.0,
+        "ram_energy_kwh":         round(data.ram_energy, 6)       if data else 0.0,
+        "cpu_energy_kwh":         round(data.cpu_energy, 6)       if data else 0.0,
+        "gpu_energy_kwh":         round(data.gpu_energy, 6)       if data else 0.0,
+        "region":                 (data.region or "unknown")       if data else "unknown",
+        "country_name":           (data.country_name or "unknown") if data else "unknown",
+        "country_iso_code":       (data.country_iso_code or "unknown") if data else "unknown",
+    }
+
     with open(EMISSIONS_LOG, "a", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=EMISSIONS_COLUMNS).writerow({
-            "screen_id":              screen_id,
-            "agent":                  agent,
-            "energy_kwh":             round(energy_kwh, 6),
-            "emissions_kg_co2":       round(emissions_kg or 0.0, 8),
-            "total_emissions_kg_co2": round(emissions_kg or 0.0, 8),
-            "duration_seconds":       round(duration_s, 2),
-            "ram_power_w":            round(data.ram_power, 4)        if data else 0.0,
-            "cpu_power_w":            round(data.cpu_power, 4)        if data else 0.0,
-            "gpu_power_w":            round(data.gpu_power, 4)        if data else 0.0,
-            "ram_energy_kwh":         round(data.ram_energy, 6)       if data else 0.0,
-            "cpu_energy_kwh":         round(data.cpu_energy, 6)       if data else 0.0,
-            "gpu_energy_kwh":         round(data.gpu_energy, 6)       if data else 0.0,
-            "region":                 (data.region or "unknown")       if data else "unknown",
-            "country_name":           (data.country_name or "unknown") if data else "unknown",
-            "country_iso_code":       (data.country_iso_code or "unknown") if data else "unknown",
-        })
+        csv.DictWriter(f, fieldnames=EMISSIONS_COLUMNS).writerow(row)
+
+    if BATCH_EMISSIONS_LOG:
+        with open(BATCH_EMISSIONS_LOG, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=EMISSIONS_COLUMNS).writerow(row)
 
     print(f"   🌱 {agent} — {round(emissions_kg or 0.0, 8)} kg CO2 | "
           f"{round(energy_kwh, 6)} kWh | {round(duration_s, 2)}s | "
           f"GPU: {round(data.gpu_power, 2) if data else 0.0}W | "
           f"region: {data.region if data else 'unknown'}")
+
+
+def _write_batch_summary(screens_processed: list):
+    """Write one summary row for this batch by re-reading its own emissions log."""
+    if not BATCH_SUMMARY_FILE:
+        return
+
+    total_energy = 0.0
+    total_emissions = 0.0
+    total_duration = 0.0
+    if os.path.exists(BATCH_EMISSIONS_LOG):
+        with open(BATCH_EMISSIONS_LOG, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                total_energy    += float(r.get("energy_kwh") or 0.0)
+                total_emissions += float(r.get("emissions_kg_co2") or 0.0)
+                total_duration  += float(r.get("duration_seconds") or 0.0)
+
+    with open(BATCH_SUMMARY_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "batch_id", "screens_processed", "total_energy_kwh",
+            "total_emissions_kg_co2", "total_duration_seconds",
+            "started_at", "ended_at",
+        ])
+        w.writeheader()
+        w.writerow({
+            "batch_id":               BATCH_ID,
+            "screens_processed":      len(screens_processed),
+            "total_energy_kwh":       round(total_energy, 6),
+            "total_emissions_kg_co2": round(total_emissions, 8),
+            "total_duration_seconds": round(total_duration, 2),
+            "started_at":             _batch_started_at,
+            "ended_at":               time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    print(f"🌱 Batch {BATCH_ID} summary saved → {BATCH_SUMMARY_FILE}")
 
 
 def _load_checkpoint() -> set:
@@ -130,6 +215,44 @@ def _mark_completed(screen_id: str):
         f.write(screen_id + "\n")
 
 
+def _rollback_incomplete_screens(completed: set):
+    """
+    Remove any rows left behind by a screen that started but never reached
+    _mark_completed() (e.g. Ctrl+C mid-pipeline). Safe to run every startup:
+    any screen_id found in these files that is NOT in the checkpoint is by
+    definition partial, since completion is only recorded after all 5 agents
+    succeed. This also backs out that screen's emissions/energy rows so
+    reprocessing it doesn't double-count energy or CO2.
+    """
+    files_and_key = [
+        (EMISSIONS_LOG, "screen_id"),
+        ("outputs/testcases_master.csv", "screen_id"),
+        ("outputs/metamorphic_relations_master.csv", "screen_id"),
+        ("outputs/optimized_relations_master.csv", "screen_id"),
+        ("outputs/reduced_suite_master.csv", "screen_id"),
+        ("outputs/energy_savings_summary.csv", "screen_id"),
+    ]
+
+    for path, key in files_and_key:
+        if not os.path.exists(path):
+            continue
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+        if not fieldnames or key not in fieldnames:
+            continue
+        kept = [r for r in rows if r.get(key) in completed]
+        dropped = len(rows) - len(kept)
+        if dropped:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(kept)
+            print(f"🧹 Rolled back {dropped} partial row(s) from {path} "
+                  f"(incomplete screen from a previous interrupted run)")
+
+
 # ─── Fresh start: wipe everything ─────────────────────────────────────────────
 
 if args.fresh:
@@ -139,6 +262,7 @@ if args.fresh:
     os.makedirs("outputs", exist_ok=True)
 
 completed_screens = _load_checkpoint()
+_rollback_incomplete_screens(completed_screens)
 is_first_run = not os.path.exists(EMISSIONS_LOG)
 
 if is_first_run:
@@ -197,6 +321,8 @@ if not image_files:
 
 # ─── Process images ────────────────────────────────────────────────────────────
 
+batch_screens_done = []
+
 for idx, image_file in enumerate(image_files, start=1):
     full_path = os.path.join(IMAGES_DIR, image_file)
     screen_id = os.path.splitext(image_file)[0]
@@ -237,6 +363,8 @@ for idx, image_file in enumerate(image_files, start=1):
 
         save_test_cases(tc_data)
         append_to_master_csv(tc_data)
+        if BATCH_DIR:
+            append_to_master_csv(tc_data, master_path=BATCH_MASTER_PATHS["testcases"])
 
         # ── Agent 3 — Metamorphic Testing ─────────────────────────────────
         tracker = EmissionsTracker(
@@ -253,6 +381,8 @@ for idx, image_file in enumerate(image_files, start=1):
 
         save_mr_data(mr_data)
         append_mr_to_master_csv(mr_data)
+        if BATCH_DIR:
+            append_mr_to_master_csv(mr_data, master_path=BATCH_MASTER_PATHS["mrs"])
 
         # ── Agent 4 — Optimization ─────────────────────────────────────────
         tracker = EmissionsTracker(
@@ -269,6 +399,8 @@ for idx, image_file in enumerate(image_files, start=1):
 
         save_optimized_mr_data(opt_data)
         append_optimized_mr_to_master(opt_data)
+        if BATCH_DIR:
+            append_optimized_mr_to_master(opt_data, master_path=BATCH_MASTER_PATHS["optimized"])
 
         # ── Agent 5 — Suite Reduction & Energy Savings ─────────────────────
         tracker = EmissionsTracker(
@@ -285,9 +417,16 @@ for idx, image_file in enumerate(image_files, start=1):
         save_reduced_suite(reduced_data)
         append_reduced_to_master(reduced_data)
         append_savings_summary(reduced_data)
+        if BATCH_DIR:
+            append_reduced_to_master(reduced_data, master_path=BATCH_MASTER_PATHS["reduced"])
+            append_savings_summary(reduced_data, summary_path=BATCH_MASTER_PATHS["savings"])
 
         # ── Mark this screen done — only after ALL agents succeeded ────────
         _mark_completed(screen_id)
+        if BATCH_DIR:
+            batch_screens_done.append(screen_id)
+            with open(BATCH_SCREENS_FILE, "a", encoding="utf-8") as f:
+                f.write(screen_id + "\n")
         print(f"✅ Pipeline complete for {screen_id} ({idx}/{len(image_files)} this run)")
 
     except Exception as e:
@@ -302,3 +441,7 @@ if remaining_after > 0:
 else:
     print("🎉 All images in the dataset have now been processed")
 print(f"🌱 Emissions log saved → {EMISSIONS_LOG}")
+
+if BATCH_DIR:
+    _write_batch_summary(batch_screens_done)
+    print(f"📦 Batch {BATCH_ID} outputs saved → {BATCH_DIR}/")
