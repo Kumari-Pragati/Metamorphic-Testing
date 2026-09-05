@@ -7,13 +7,18 @@
 #
 # Usage:
 #   python benchmark_pipeline.py --model qwen
-#       Process all images, 3 runs (default), each run in one batch.
+#       Process all images, 3 runs (default), each run in batches of 100
+#       (the default batch size) — checkpointed after every batch, safe to
+#       Ctrl+C and re-run to resume.
 #
-#   python benchmark_pipeline.py --model phi35 --batch-size 100
-#       Same, but each run is processed 100 images at a time, checkpointed
-#       after every batch — safe to Ctrl+C and re-run to resume.
+#   python benchmark_pipeline.py --model phi35 --batch-size 250
+#       Same, but 250 images per batch instead of the default 100.
 #
-#   python benchmark_pipeline.py --model internvl --batch-size 100 --max-batches 3
+#   python benchmark_pipeline.py --model qwen --batch-size 0
+#       Process each run's remaining images in one single batch instead
+#       (old pre-batching behavior).
+#
+#   python benchmark_pipeline.py --model internvl --max-batches 3
 #       Quick test: only run 3 batches this invocation, then stop (even if
 #       the run isn't finished). Re-run the same command to continue.
 #
@@ -54,6 +59,10 @@ COOLDOWN_SECONDS = 60
 # This just lets things settle first. Not applied again between runs —
 # COOLDOWN_SECONDS already handles that.
 WARMUP_STABILIZE_SECONDS = 300
+
+# Default images processed per batch within a run, if --batch-size isn't
+# passed. Pass --batch-size 0 to process a whole run in one batch instead.
+DEFAULT_BATCH_SIZE = 100
 
 # Models to benchmark — add more entries here as you test new SLMs.
 # Each entry is a dict with:
@@ -134,10 +143,10 @@ parser.add_argument(
 parser.add_argument(
     "--batch-size",
     type=int,
-    default=None,
-    help="Images processed per batch within a run. Omit to process all "
-         "remaining images for a run in a single batch (old behavior, just "
-         "now checkpointed/resumable).",
+    default=DEFAULT_BATCH_SIZE,
+    help=f"Images processed per batch within a run (default: {DEFAULT_BATCH_SIZE}). "
+         "The last batch in a run shrinks to fit whatever's left. Pass 0 to "
+         "process all remaining images for a run in a single batch instead.",
 )
 parser.add_argument(
     "--max-batches",
@@ -548,7 +557,7 @@ for run_idx in range(1, NUM_RUNS + 1):
             break
 
         batch_id = _next_batch_id(run_out_dir)
-        this_batch_size = len(remaining) if args.batch_size is None else min(args.batch_size, len(remaining))
+        this_batch_size = len(remaining) if not args.batch_size else min(args.batch_size, len(remaining))
         batch_images = remaining[:this_batch_size]
         batches_this_invocation += 1
         prev_run_did_work = True
