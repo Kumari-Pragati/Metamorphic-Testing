@@ -25,36 +25,59 @@ can't be parsed.
 
 ## Two ways to run this
 
-The repo has **two separate entry points** — pick based on what you're doing:
+`batch_runner.py` (the wrapper that looped `main.py` in batches) is gone — its
+job is now built into `benchmark_pipeline.py` itself. `main.py` stays as a
+simple, single-model backup option:
 
 | | `main.py` | `benchmark_pipeline.py` |
 | --- | --- | --- |
-| Purpose | Process the full dataset once, with Qwen | Compare energy/emissions across models |
-| Models | Qwen only (hard-coded) | `qwen`, `phi35` (see `MODELS` list — InternVL2 has its own `stages/ui_analysis_internvl.py` and `stages/text_model_internlm.py` but isn't wired into this script's `MODELS` list yet) |
-| Resume support | **Yes** — checkpoints to `outputs/completed_screens.txt`, skips already-completed screens on the next run | **No** — every invocation wipes `outputs/<model_name>/` and that model's emissions log and starts over, by design |
-| Batching | `--batch-size N` processes the next N unfinished images | Not batched — always runs the full `images/` folder, `--runs` times |
+| Purpose | Simple, single-model backup — process the full dataset once, with Qwen | Compare energy/emissions across models |
+| Models | Qwen only (hard-coded) | `qwen`, `phi35`, `internvl` (see `MODELS` list) |
+| Resume support | Yes — checkpoints to `outputs/completed_screens.txt` | Yes — checkpoints to `outputs/<model>/run_N/completed_screens.txt`, per run |
+| Batching | `--batch-size N` processes the next N unfinished images | `--batch-size N` per run, plus `--max-batches` to cap an invocation |
+| Runs | Always a single pass | `--runs` timed repeats (default 3) per model |
+| Output layout | Flat `outputs/` | Namespaced `outputs/<model_name>/run_N/` |
+| Warmup stabilization | No | Yes — 300s wait after warmup before the first timed run, so leftover GPU/driver activity doesn't skew Run 1 |
+| `--fresh` | Wipes `outputs/` entirely | Wipes `outputs/<model_name>/` and that model's emissions log only |
 
-⚠️ **`main.py --fresh` deletes `outputs/` entirely, including the checkpoint file.**
-Only pass `--fresh` if you actually want to discard all progress and start over —
-never combine it with `--batch-size` out of habit.
+Use `main.py` when you just want one clean, resumable Qwen pass without the
+multi-model machinery. Use `benchmark_pipeline.py` when you're comparing
+models or want the finer-grained per-run/per-batch output structure.
 
-## Models benchmarked (via `benchmark_pipeline.py`)
+```powershell
+# benchmark_pipeline.py
+python benchmark_pipeline.py --model qwen
+python benchmark_pipeline.py --model phi35 --batch-size 100
+python benchmark_pipeline.py --model internvl --batch-size 100 --max-batches 3   # quick test
+python benchmark_pipeline.py --model qwen --runs 1
+python benchmark_pipeline.py --model qwen --fresh
+```
+
+⚠️ **`--fresh` on `benchmark_pipeline.py` deletes `outputs/<model_name>/`
+entirely, including its checkpoints and batch logs**, plus that model's
+emissions log. **`--fresh` on `main.py` deletes all of `outputs/`, including
+its checkpoint file.** Only pass either if you actually want to discard
+progress and start over.
+
+## Models benchmarked
 
 | Model pair | Vision model            | Text model            | Params (approx)                  |
 | ---------- | ------------------------ | ---------------------- | --------------------------------- |
 | Qwen       | Qwen2-VL-7B-Instruct     | Qwen2.5-7B-Instruct    | 7B / 7B                           |
 | Phi-3.5    | Phi-3.5-vision-instruct  | Phi-3.5-mini-instruct  | 4.2B / 3.8B                       |
-| InternVL2  | InternVL2-8B             | internlm2_5-7b-chat    | 8B / 7B (matched pair, same lab) — stage files exist but not yet in `benchmark_pipeline.py`'s `MODELS` list |
+| InternVL2  | InternVL2-8B             | internlm2_5-7b-chat    | 8B / 7B (matched pair, same lab)  |
 
-`benchmark_pipeline.py` runs each configured model **5 timed passes** (`--runs` to
-override) across every screenshot in `images/`, with per-agent energy (kWh),
-emissions (kg CO2), and duration logged via CodeCarbon.
+All three are wired into `benchmark_pipeline.py`'s `MODELS` list — pick one with
+`--model qwen` / `--model phi35` / `--model internvl`. Each does `--runs` timed
+passes (default 3) across every screenshot in `images/`, with per-agent energy
+(kWh), emissions (kg CO2), and duration logged via CodeCarbon.
 
 ## Repository structure
 
 ```
-├── main.py                        # Full-dataset run with Qwen, resumable via checkpoint + --batch-size
-├── benchmark_pipeline.py          # Multi-model comparison runner (qwen, phi35) — no resume, wipes outputs each run
+├── main.py                        # Simple single-model backup — full-dataset run with Qwen,
+│                                   #   resumable via checkpoint + --batch-size, flat outputs/
+├── benchmark_pipeline.py          # Multi-model comparison runner — resumable, batched, per-model outputs
 ├── breakeven_check.py             # Reads outputs from a main.py run; computes how many regression
 │                                   #   cycles it takes for Agent 5's own generation cost to pay for
 │                                   #   itself via its projected per-cycle savings
@@ -62,7 +85,6 @@ emissions (kg CO2), and duration logged via CodeCarbon.
 │                                   #   into summary tables + chart
 ├── design_topics.csv              # Screen ID -> topic mapping (ENRICO metadata)
 ├── images/                        # Input screenshots — NOT tracked in git, populate this yourself
-├── images_done/                   # Tracked sample images left in git history — not read by either script
 ├── stages/
 │   ├── ui_analysis.py             # Agent 1 — Qwen2-VL
 │   ├── ui_analysis_phi.py         # Agent 1 — Phi-3.5-vision
@@ -79,7 +101,12 @@ emissions (kg CO2), and duration logged via CodeCarbon.
     ├── completed_screens.txt      # main.py's checkpoint file
     ├── emissions_log.csv          # main.py's single-model emissions log
     ├── emissions_log_<model>.csv  # benchmark_pipeline.py's per-model emissions log
-    └── <model_name>/run_1 .. run_5/   # benchmark_pipeline.py per-run outputs
+    └── <model_name>/
+        └── run_1 .. run_N/        # benchmark_pipeline.py per-run outputs
+            ├── completed_screens.txt   # Checkpoint — which screens finished all 5 agents
+            ├── batch_log.csv           # One row per batch: timing, images processed, status
+            ├── next_batch_id.txt       # Persistent batch-id counter (survives Ctrl+C/restart)
+            └── testcases_master.csv, metamorphic_relations_master.csv, etc.
 ```
 
 **Note:** `stages/test_generation.py`'s `load_text_model()` doubles as both the
@@ -124,7 +151,7 @@ pip install accelerate pillow json_repair codecarbon einops timm sentencepiece p
 Place your ENRICO screenshots in an `images/` folder at the repo root before
 running anything — it's gitignored, so it won't come from `git clone`.
 
-## Running the full dataset (recommended: `main.py`, Qwen)
+## Running the full dataset (simple backup: `main.py`, Qwen)
 
 ```powershell
 # process the next 1000 not-yet-completed images
@@ -159,14 +186,32 @@ python benchmark_pipeline.py --model qwen
 
 # Phi-3.5 — from .venv-vision
 python benchmark_pipeline.py --model phi35
+
+# InternVL2 — from .venv-vision
+python benchmark_pipeline.py --model internvl
 ```
 
-Every invocation **wipes and rebuilds** `outputs/<model_name>/` and
-`outputs/emissions_log_<model_name>.csv` from scratch — there's no resume here,
-so let it finish once you start it. Each run does 5 timed passes (`--runs` to
-change) across every image in `images/`, with a 60-second cooldown between runs.
-All agents use greedy decoding (`do_sample=False`), so the 5 runs measure
-energy/timing stability, not output variance.
+By default this does `--runs` (3) timed passes over every image in `images/`,
+each run processed in one batch, with a 60-second cooldown between runs and a
+300-second stabilization wait after warmup before Run 1 starts. All agents use
+greedy decoding (`do_sample=False`), so the runs measure energy/timing
+stability, not output variance.
+
+To process in chunks instead (recommended for large datasets, since it's
+checkpointed after every batch):
+
+```powershell
+python benchmark_pipeline.py --model qwen --batch-size 200
+```
+
+Stop it (Ctrl+C) and re-run the exact same command any time — it picks up from
+`outputs/qwen/run_N/completed_screens.txt` rather than starting over.
+
+For a quick smoke test without committing to a full run:
+
+```powershell
+python benchmark_pipeline.py --model qwen --batch-size 50 --max-batches 1
+```
 
 ### Smoke-testing a single agent (any model)
 
