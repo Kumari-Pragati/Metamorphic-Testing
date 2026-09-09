@@ -34,7 +34,7 @@ simple, single-model backup option:
 | Purpose | Simple, single-model backup — process the full dataset once, with Qwen | Compare energy/emissions across models |
 | Models | Qwen only (hard-coded) | `qwen`, `phi35`, `internvl` (see `MODELS` list) |
 | Resume support | Yes — checkpoints to `outputs/completed_screens.txt` | Yes — checkpoints to `outputs/<model>/run_N/completed_screens.txt`, per run |
-| Batching | `--batch-size N` processes the next N unfinished images | `--batch-size N` per run, plus `--max-batches` to cap an invocation |
+| Batching | `--batch-size N` processes the next N unfinished images (no default — omit to process all remaining in one go) | `--batch-size N` per run, defaults to 100 for every model, plus `--max-batches` to cap an invocation |
 | Runs | Always a single pass | `--runs` timed repeats (default 3) per model |
 | Output layout | Flat `outputs/` | Namespaced `outputs/<model_name>/run_N/` |
 | Warmup stabilization | No | Yes — 300s wait after warmup before the first timed run, so leftover GPU/driver activity doesn't skew Run 1 |
@@ -45,10 +45,10 @@ multi-model machinery. Use `benchmark_pipeline.py` when you're comparing
 models or want the finer-grained per-run/per-batch output structure.
 
 ```powershell
-# benchmark_pipeline.py
+# benchmark_pipeline.py — all three default to 100-image batches per run
 python benchmark_pipeline.py --model qwen
-python benchmark_pipeline.py --model phi35 --batch-size 100
-python benchmark_pipeline.py --model internvl --batch-size 100 --max-batches 3   # quick test
+python benchmark_pipeline.py --model phi35 --batch-size 250
+python benchmark_pipeline.py --model internvl --max-batches 3   # quick test, still batches of 100
 python benchmark_pipeline.py --model qwen --runs 1
 python benchmark_pipeline.py --model qwen --fresh
 ```
@@ -83,8 +83,8 @@ passes (default 3) across every screenshot in `images/`, with per-agent energy
 │                                   #   itself via its projected per-cycle savings
 ├── summarize_emissions.py         # Aggregates outputs/emissions_log_*.csv (from benchmark_pipeline.py)
 │                                   #   into summary tables + chart
-├── design_topics.csv              # Screen ID -> topic mapping (ENRICO metadata)
-├── images/                        # Input screenshots — NOT tracked in git, populate this yourself
+├── design_topics.csv              # Screen ID -> topic mapping (ENRICO metadata) — tracked in git
+├── images/                        # Input screenshots (ENRICO) — tracked in git, ready to use after clone
 ├── stages/
 │   ├── ui_analysis.py             # Agent 1 — Qwen2-VL
 │   ├── ui_analysis_phi.py         # Agent 1 — Phi-3.5-vision
@@ -130,12 +130,23 @@ this for Phi-3.5-vision, Phi-3.5-mini, and InternVL2-8B.
 
 ## Setup
 
+**Requirements:** Python 3.10+ (matching what this was developed/tested against),
+and a CUDA-capable GPU — each model pair (VLM + text LLM, ~7-8B params each) needs
+roughly 24GB+ VRAM loaded together in bf16. Running on less will likely OOM.
+
+**Hugging Face access:** all models are pulled from the Hugging Face Hub on first
+run. If any of Qwen2-VL, Qwen2.5, Phi-3.5, InternVL2, or internlm2_5 require
+accepting a license or are gated, run `huggingface-cli login` first — otherwise
+the first `from_pretrained()` call will fail with a 401. Internet access is
+required at least for this first run per model, to download weights into the
+local HF cache; after that, it may be able to run offline (untested here).
+
 ### 1. Qwen environment
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install torch transformers accelerate pillow qwen-vl-utils json_repair codecarbon matplotlib pandas
+pip install "transformers==5.8.1" torch accelerate pillow qwen-vl-utils json_repair codecarbon matplotlib pandas
 ```
 
 ### 2. Phi-3.5 / InternVL2 environment
@@ -148,8 +159,14 @@ pip install "transformers==4.46.1"
 pip install accelerate pillow json_repair codecarbon einops timm sentencepiece protobuf matplotlib pandas
 ```
 
-Place your ENRICO screenshots in an `images/` folder at the repo root before
-running anything — it's gitignored, so it won't come from `git clone`.
+⚠️ Before running `--model internvl` for real, do a quick standalone check that
+`internlm2_5-7b-chat`'s tokenizer has a working `chat_template` — see the
+compatibility note at the top of `stages/text_model_internlm.py`. If it's
+missing, `warmup()` will fail loudly (by design) rather than silently producing
+garbage output, but better to catch it before a long run.
+
+`images/` and `design_topics.csv` are both tracked in git, so they come straight
+from `git clone` — no setup needed for those.
 
 ## Running the full dataset (simple backup: `main.py`, Qwen)
 
@@ -192,16 +209,22 @@ python benchmark_pipeline.py --model internvl
 ```
 
 By default this does `--runs` (3) timed passes over every image in `images/`,
-each run processed in one batch, with a 60-second cooldown between runs and a
-300-second stabilization wait after warmup before Run 1 starts. All agents use
-greedy decoding (`do_sample=False`), so the runs measure energy/timing
-stability, not output variance.
+each run processed in batches of 100 images (checkpointed after every batch),
+with a 60-second cooldown between runs and a 300-second stabilization wait
+after warmup before Run 1 starts. All agents use greedy decoding
+(`do_sample=False`), so the runs measure energy/timing stability, not output
+variance.
 
-To process in chunks instead (recommended for large datasets, since it's
-checkpointed after every batch):
+To use a different batch size:
 
 ```powershell
 python benchmark_pipeline.py --model qwen --batch-size 200
+```
+
+Or to go back to the old "everything in one batch" behavior:
+
+```powershell
+python benchmark_pipeline.py --model qwen --batch-size 0
 ```
 
 Stop it (Ctrl+C) and re-run the exact same command any time — it picks up from
@@ -210,7 +233,7 @@ Stop it (Ctrl+C) and re-run the exact same command any time — it picks up from
 For a quick smoke test without committing to a full run:
 
 ```powershell
-python benchmark_pipeline.py --model qwen --batch-size 50 --max-batches 1
+python benchmark_pipeline.py --model qwen --batch-size 10 --max-batches 1
 ```
 
 ### Smoke-testing a single agent (any model)
